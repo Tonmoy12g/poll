@@ -311,11 +311,8 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
     if row:
         keyboard.append(row)
 
-    # Action / Control Buttons
+    # Action / Control Buttons (Clean layout without extra buttons)
     if not is_closed:
-        keyboard.append([
-            {"text": "👥 ভোটার তালিকা (Username & ID)", "callback_data": f"voters:{poll_id}", "style": "primary"}
-        ])
         keyboard.append([
             {"text": "🔄 ভোট প্রত্যাহার করুন", "callback_data": f"retract:{poll_id}", "style": "primary"}
         ])
@@ -323,9 +320,6 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
             {"text": "🛑 পোল সমাপ্ত ও বিজয়ী ঘোষণা", "callback_data": f"close:{poll_id}", "style": "danger"}
         ])
     else:
-        keyboard.append([
-            {"text": "👥 সম্পূর্ণ ভোটার তালিকা দেখুন", "callback_data": f"voters:{poll_id}", "style": "primary"}
-        ])
         bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
         keyboard.append([
             {"text": "🤖 আপনিও এমন আকর্ষণীয় পোল তৈরি করুন", "url": bot_link, "style": "success"}
@@ -599,11 +593,27 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
     elif text == "⚡ Create Ultra Poll" or text == "/create":
         user_states[user_id] = {"step": "waiting_for_channel"}
         create_guide = (
-            "🎯 <b>পোল ক্রিয়েশন উইজার্ড</b>\n"
+            "🎯 <b>পোল তৈরি শুরু করুন</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            "প্রথমে যে চ্যানেলে পোলটি পাঠাবেন সেই চ্যানেলের <b>ইউজারনেম বা লিংক</b> পাঠান:\n\n"
-            "<i>উদাহরণ:</i> <code>@mychannel</code> অথবা <code>https://t.me/mychannel</code>\n\n"
-            "⚠️ <b>জরুরি পারমিশন:</b> নিশ্চিত করুন যে বটকে চ্যানেলে অ্যাডমিন বানিয়ে <b>Post Messages ও Manage Channel</b> পারমিশন দেওয়া আছে।"
+            "📌 <b>চ্যানেলে বটকে অ্যাডমিন করার সময় নিচের পারমিশনগুলো অবশ্যই [ON] রাখবেন:</b>\n\n"
+            "১️⃣ <b>Post Messages (মেসেজ পোস্ট করার অনুমতি):</b>\n"
+            "👉 <b>বাধ্যতামূলক [ON]</b>\n"
+            "<i>(বট যাতে আপনার চ্যানেলে সুন্দর কালারফুল পোলটি পোস্ট করতে পারে।)</i>\n\n"
+            "২️⃣ <b>Edit Messages of Others (মেসেজ এডিট করার অনুমতি):</b>\n"
+            "👉 <b>বাধ্যতামূলক [ON]</b>\n"
+            "<i>(কেউ ভোট দেওয়ার সাথে সাথে বাটন কাউন্টার ও প্রগ্রেস বার রিয়েল-টাইমে আপডেট করার জন্য এটি দরকার।)</i>\n\n"
+            "৩️⃣ <b>Delete Messages of Others (মেসেজ ডিলিট করার অনুমতি):</b>\n"
+            "👉 <b>[ON রাখা ভালো]</b>\n"
+            "<i>(পোল সমাপ্ত করার সময় কাজে লাগবে।)</i>\n\n"
+            "৪️⃣ <b>Invite Users via Link (লিংকের মাধ্যমে ইনভাইট):</b>\n"
+            "👉 <b>[ON]</b>\n"
+            "<i>(ফোর্স সাবস্ক্রাইব এবং চ্যানেলের শেয়ার লিংক তৈরি করতে এটি প্রয়োজন।)</i>\n\n"
+            "৫️⃣ <b>Manage Channel / Recent Actions (গতিবিধি দেখা):</b>\n"
+            "👉 <b>বাধ্যতামূলক [ON]</b>\n"
+            "<i>(এই পারমিশন অন থাকলেই কেবল টেলিগ্রাম বটকে জানাবে যে কে চ্যানেলে জয়েন করল আর কে চ্যানেল থেকে লিভ নিল—ফলে লিভ নেওয়া মাত্রই ভোট কেটে ফেলার ম্যাজিক সিস্টেমটি নিখুঁতভাবে কাজ করবে!)</i>\n"
+            "━━━━━━━━━━━━━━━━━━━━\n"
+            "👇 <b>এখন আপনার চ্যানেলের ইউজারনেম বা লিংক (@ সহ) লিখে পাঠান:</b>\n\n"
+            "<i>উদাহরণ:</i> <code>@mychannel</code> অথবা <code>https://t.me/mychannel</code>"
         )
         bot.send_message(chat_id, create_guide)
 
@@ -910,8 +920,30 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
             # Cast vote
             c.execute("INSERT INTO votes (poll_id, user_id, option_index) VALUES (?, ?, ?)", (poll_id, user_id, opt_idx))
             conn.commit()
-            conn.close()
             bot.answer_callback(cb_id, f"🎉 আপনার ভোট গৃহীত হয়েছে: {opt_name}", show_alert=False)
+
+        # Automatically notify the poll creator in bot DM!
+        c.execute("SELECT creator_id, channel_id, title FROM polls WHERE poll_id = ?", (poll_id,))
+        poll_info = c.fetchone()
+        conn.close()
+
+        if poll_info:
+            c_creator_id, c_channel, c_title = poll_info
+            try:
+                bot.send_message(
+                    c_creator_id,
+                    f"🔔 <b>নতুন ভোট গ্রহণ নোটিফিকেশন!</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📌 <b>পোল:</b> {c_title}\n"
+                    f"📢 <b>চ্যানেল:</b> {c_channel}\n\n"
+                    f"👤 <b>ভোটারের নাম:</b> {first_name}\n"
+                    f"🏷️ <b>ইউজারনেম:</b> @{username if username else 'N/A'}\n"
+                    f"🆔 <b>ইউজার আইডি:</b> <code>{user_id}</code>\n"
+                    f"🎯 <b>যাকে ভোট দেওয়া হয়েছে:</b> <b>{opt_name}</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━"
+                )
+            except Exception as e:
+                logger.error(f"Error notifying creator {c_creator_id}: {e}")
 
         # Update the live channel message & colored buttons
         new_text, new_markup = build_live_poll_content(poll_id, bot_username)
