@@ -120,6 +120,12 @@ def init_db():
         revoked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         reason TEXT DEFAULT 'left_channel'
     )''')
+    # Force channels table for Admin Panel unlimited force-sub channels
+    c.execute('''CREATE TABLE IF NOT EXISTS force_channels (
+        channel_username TEXT PRIMARY KEY,
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+
     # Settings table (for dynamic support & channel IDs via Admin Panel)
     c.execute('''CREATE TABLE IF NOT EXISTS settings (
         key TEXT PRIMARY KEY,
@@ -129,6 +135,39 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', ?)", (DEFAULT_SUPPORT_USERNAME,))
     c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_username', ?)", (DEFAULT_CHANNEL_USERNAME,))
 
+    conn.commit()
+    conn.close()
+
+
+def get_force_channels() -> List[str]:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT channel_username FROM force_channels ORDER BY added_at ASC")
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def add_force_channel(channel: str):
+    ch = clean_channel_id(channel)
+    if ch:
+        conn = sqlite3.connect(DB_FILE)
+        c = conn.cursor()
+        c.execute("INSERT OR IGNORE INTO force_channels (channel_username) VALUES (?)", (ch,))
+        conn.commit()
+        conn.close()
+
+def remove_force_channel(channel: str):
+    ch = clean_channel_id(channel)
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM force_channels WHERE channel_username = ? OR channel_username = ?", (ch, ch.replace("@", "")))
+    conn.commit()
+    conn.close()
+
+def clear_all_force_channels():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("DELETE FROM force_channels")
     conn.commit()
     conn.close()
 
@@ -402,6 +441,46 @@ def cancel_keyboard():
         "resize_keyboard": True
     }
 
+
+def check_user_bot_force_sub(bot: TelegramBot, user_id: int) -> (bool, List[str]):
+    """
+    Checks if a user has joined the admin force-sub channels required to use the bot.
+    Admin is always exempted.
+    """
+    if user_id == ADMIN_ID:
+        return True, []
+
+    f_channels = get_force_channels()
+    if not f_channels:
+        return True, []
+
+    missing = []
+    for ch in f_channels:
+        chk = bot.get_chat_member(ch, user_id)
+        if chk.get("ok"):
+            status = chk["result"].get("status")
+            if status in ["left", "kicked"]:
+                missing.append(ch)
+        else:
+            # If check fails (e.g. invalid username), ignore
+            pass
+
+    return (len(missing) == 0), missing
+
+def build_bot_force_sub_card(missing_channels: List[str]):
+    text = (
+        "👋 <b>আসসালামু আলাইকুম!</b>\n\n"
+        "✨ আমাদের <b>পোল মেকার বটটি</b> ব্যবহার করার পূর্বে আপনাকে অবশ্যই আমাদের অফিসিয়াল চ্যানেলে যুক্ত হতে হবে।\n\n"
+        "👇 <b>নিচের চ্যানেলে জয়েন করে '✅ জয়েন করেছি / Verify' বাটনে চাপ দিন:</b>"
+    )
+    buttons = []
+    for ch in missing_channels:
+        un = ch.replace("@", "")
+        buttons.append([{"text": f"📢 জয়েন করুন: {ch}", "url": f"https://t.me/{un}", "style": "primary"}])
+
+    buttons.append([{"text": "✅ জয়েন করেছি / Verify", "callback_data": "verify_bot_fsub", "style": "success"}])
+    return text, {"inline_keyboard": buttons}
+
 def main_menu_keyboard(user_id: int):
     buttons = [
         [{"text": "⚡ Create Ultra Poll", "style": "primary"}],
@@ -525,6 +604,28 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
             )
             return
 
+        elif step == "waiting_for_add_fsub":
+            del user_states[user_id]
+            # Split by comma or newline
+            raw_entries = text.replace(",", "\n").split("\n")
+            added_list = []
+            for entry in raw_entries:
+                entry = entry.strip()
+                if entry:
+                    ch_cleaned = clean_channel_id(entry)
+                    add_force_channel(ch_cleaned)
+                    added_list.append(ch_cleaned)
+
+            bot.send_message(
+                chat_id,
+                f"✅ <b>সফলভাবে {len(added_list)}টি ফোর্স চ্যানেল যোগ করা হয়েছে!</b>\n\n"
+                "এখন থেকে যেকেউ যেকোনো পোলে ভোট দেওয়ার সময় এই সবকটি চ্যানেলে জয়েন থাকা বাধ্যতামূলক।\n\n"
+                f"তালিকা:\n" + "\n".join([f"• {c}" for c in added_list]),
+                reply_markup=main_menu_keyboard(user_id)
+            )
+            send_admin_dashboard(bot, chat_id)
+            return
+
     # Step-by-Step Creation Wizard
     if chat_type == "private" and user_id in user_states:
         state = user_states[user_id]
@@ -595,6 +696,14 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
                 "<i>(এটি চালু রাখলে আপনার চ্যানেলে প্রচুর রিয়েল সাবস্ক্রাইবার বাড়বে এবং ফেক ভোট রোধ হবে!)</i>",
                 reply_markup=markup
             )
+            return
+
+    # BOT-LEVEL FORCE SUBSCRIBE CHECK: User must join admin's channel to use the bot!
+    if chat_type == "private" and user_id != ADMIN_ID:
+        is_subbed, missing_chs = check_user_bot_force_sub(bot, user_id)
+        if not is_subbed:
+            fsub_text, fsub_markup = build_bot_force_sub_card(missing_chs)
+            bot.send_message(chat_id, fsub_text, reply_markup=fsub_markup)
             return
 
     # Menu Commands
@@ -739,6 +848,12 @@ def send_admin_dashboard(bot: TelegramBot, chat_id: int):
     support_un = get_setting("support_username", DEFAULT_SUPPORT_USERNAME)
     channel_un = get_setting("channel_username", DEFAULT_CHANNEL_USERNAME)
 
+    f_channels = get_force_channels()
+    if f_channels:
+        f_list = "\n".join([f"  {idx}. {ch}" for idx, ch in enumerate(f_channels, 1)])
+    else:
+        f_list = "  <i>(কোনো ফোর্স চ্যানেল যোগ করা নেই)</i>"
+
     admin_text = (
         "👑 <b>অ্যাডমিন কন্ট্রোল ড্যাশবোর্ড</b>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
@@ -747,15 +862,18 @@ def send_admin_dashboard(bot: TelegramBot, chat_id: int):
         f"🟢 <b>একটিভ পোল:</b> {active_polls} টি\n"
         f"🎯 <b>মোট বৈধ ভোট:</b> {total_votes} টি\n"
         f"🚫 <b>চ্যানেল লিভে বাতিল ভোট:</b> {total_revoked} টি\n\n"
+        f"🛡️ <b>ফোর্স সাবস্ক্রাইব চ্যানেলসমূহ ({len(f_channels)} টি):</b>\n{f_list}\n\n"
         "⚙️ <b>বর্তমান ডায়নামিক সেটিংস:</b>\n"
         f"• <b>সাপোর্ট আইডি:</b> @{support_un}\n"
         f"• <b>অফিসিয়াল চ্যানেল:</b> @{channel_un}\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
-        "👇 <i>নিচের বাটন দিয়ে সেটিংস পরিবর্তন বা ব্রডকাস্ট করুন:</i>"
+        "👇 <i>নিচের বাটন দিয়ে আনলিমিটেড ফোর্স চ্যানেল ও সেটিংস নিয়ন্ত্রণ করুন:</i>"
     )
 
     markup = {
         "inline_keyboard": [
+            [{"text": "➕ ফোর্স চ্যানেল যোগ করুন (Unlimited)", "callback_data": "adm_add_fsub", "style": "success"}],
+            [{"text": "🗑️ ফোর্স চ্যানেল ম্যানেজ / রিমুভ", "callback_data": "adm_manage_fsub", "style": "danger"}],
             [{"text": "📢 ব্রডকাস্ট মেসেজ পাঠান", "callback_data": "adm_broadcast", "style": "primary"}],
             [{"text": "✏️ সাপোর্ট আইডি পরিবর্তন", "callback_data": "adm_support", "style": "success"}],
             [{"text": "📢 চ্যানেল ইউজারনেম পরিবর্তন", "callback_data": "adm_channel", "style": "primary"}],
@@ -811,6 +929,53 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
                 "যেমন: <code>@MyChannelUsername</code>\n\n"
                 "<i>বাতিল করতে চাইলে /cancel লিখুন।</i>"
             )
+            return
+
+        elif data == "adm_add_fsub":
+            user_states[user_id] = {"step": "waiting_for_add_fsub"}
+            bot.answer_callback(cb_id)
+            bot.send_message(
+                chat_id,
+                "🛡️ <b>আনলিমিটেড ফোর্স সাবস্ক্রাইব চ্যানেল যোগ করুন:</b>\n\n"
+                "যেসব চ্যানেলে ভোটারদের জয়েন করা বাধ্যতামূলক করতে চান তাদের ইউজারনেম পাঠান।\n"
+                "আপনি চাইলে একসাথে একাধিক চ্যানেল কমা (,) দিয়ে বা প্রতি লাইনে একটি করে পাঠাতে পারেন:\n\n"
+                "<i>উদাহরণ:</i>\n<code>@channel1, @channel2, @channel3</code>\n\n"
+                "<i>(বাতিল করতে '❌ বাতিল করুন' বাটনে চাপ দিন)</i>",
+                reply_markup=cancel_keyboard()
+            )
+            return
+
+        elif data == "adm_manage_fsub":
+            f_channels = get_force_channels()
+            bot.answer_callback(cb_id)
+            if not f_channels:
+                bot.send_message(chat_id, "ℹ️ বর্তমানে কোনো ফোর্স চ্যানেল সেট করা নেই।")
+                return
+
+            buttons = []
+            for ch in f_channels:
+                buttons.append([{"text": f"❌ মুছে ফেলুন: {ch}", "callback_data": f"adm_rm_fsub:{ch}", "style": "danger"}])
+            buttons.append([{"text": "🧹 সব ফোর্স চ্যানেল ক্লিয়ার করুন", "callback_data": "adm_clear_all_fsub", "style": "danger"}])
+            buttons.append([{"text": "🔙 অ্যাডমিন ড্যাশবোর্ড", "callback_data": "adm_refresh", "style": "primary"}])
+
+            bot.send_message(
+                chat_id,
+                "🗑️ <b>ফোর্স চ্যানেল রিমুভ / ম্যানেজ করুন:</b>\n\nযে চ্যানেলটি ডিলিট করতে চান তার নামের পাশের লাল বাটনে চাপ দিন:",
+                reply_markup={"inline_keyboard": buttons}
+            )
+            return
+
+        elif data.startswith("adm_rm_fsub:"):
+            target_ch = data.replace("adm_rm_fsub:", "")
+            remove_force_channel(target_ch)
+            bot.answer_callback(cb_id, f"✅ {target_ch} মুছে ফেলা হয়েছে!", show_alert=True)
+            send_admin_dashboard(bot, chat_id)
+            return
+
+        elif data == "adm_clear_all_fsub":
+            clear_all_force_channels()
+            bot.answer_callback(cb_id, "🧹 সকল ফোর্স চ্যানেল ডিলিট করা হয়েছে!", show_alert=True)
+            send_admin_dashboard(bot, chat_id)
             return
 
         elif data == "adm_refresh":
@@ -901,7 +1066,7 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
 
         _, force_sub = poll_info
 
-        # Force Subscribe Verification Check
+        # Poll Channel Membership Check (Only for the channel where the poll was posted)
         if force_sub:
             chk = bot.get_chat_member(force_sub, user_id)
             if chk.get("ok"):
@@ -1001,6 +1166,28 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
 
         new_text, new_markup = build_live_poll_content(poll_id, bot_username)
         bot.edit_message(chat_id, message_id, new_text, reply_markup=new_markup)
+
+    # Verify Bot-Level Force Subscribe Callback
+    elif data == "verify_bot_fsub":
+        is_subbed, missing_chs = check_user_bot_force_sub(bot, user_id)
+        if is_subbed:
+            bot.answer_callback(cb_id, "✅ ভেরিফিকেশন সফল হয়েছে! স্বাগতম!", show_alert=True)
+            welcome = (
+                f"👑 <b>আসসালামু আলাইকুম, {from_user.get('first_name', 'User')}!</b>\n\n"
+                "✨ <b>UltraPoll Pro</b> — টেলিগ্রামের সবচেয়ে আধুনিক ও কালারফুল পোল মেকার বটে স্বাগতম!\n\n"
+                "🚀 <b>আমাদের প্রিমিয়াম ফিচারসমূহ:</b>\n"
+                "• 🎨 <b>ফুল কালার বাটন:</b> নীল, সবুজ ও লাল স্টাইলের নজরকাড়া বাটন\n"
+                "• 👑 <b>লাইভ ক্রাউন সিস্টেম:</b> লিডার প্রার্থীর বাটনে স্বয়ংক্রিয় মুকুট\n"
+                "• 📊 <b>গ্রাফিক্যাল প্রগ্রেস বার:</b> পার্সেন্টেজসহ রিয়েল-টাইম ডিসপ্লে\n"
+                "• 🚫 <b>অটো ভোট কর্তন:</b> চ্যানেল লিভ নিলে সাথে সাথে ভোট বাতিল!\n"
+                "• 🔄 <b>ভোট প্রত্যাহার ও পরিবর্তনের সুবিধা</b>\n"
+                "• 🛑 <b>১-ক্লিকে চূড়ান্ত বিজয়ী কার্ড ঘোষণা</b>\n\n"
+                "👇 <b>পোল তৈরি করতে নিচের বাটনে চাপ দিন:</b>"
+            )
+            bot.send_message(chat_id, welcome, reply_markup=main_menu_keyboard(user_id))
+        else:
+            bot.answer_callback(cb_id, "⚠️ আপনি এখনো সবকটি চ্যানেলে জয়েন করেননি! দয়া করে আগে জয়েন করুন।", show_alert=True)
+        return
 
     # View Voters List (Names, Usernames & User IDs)
     elif data.startswith("voters:"):
@@ -1102,6 +1289,7 @@ def handle_chat_member_updated(bot: TelegramBot, update_data: Dict, bot_username
             ch_patterns.append(f"@{chat_username.lower()}")
             ch_patterns.append(chat_username.lower())
 
+        # Revoke votes ONLY from the specific poll whose channel the user left!
         placeholders = ",".join("?" for _ in ch_patterns)
         query = f"""
             SELECT p.poll_id, p.message_id, p.channel_id, p.title, v.option_index
