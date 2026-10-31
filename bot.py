@@ -17,6 +17,7 @@ import json
 import sqlite3
 import logging
 import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import Dict, List, Any, Optional
 import requests
 
@@ -26,12 +27,34 @@ logging.basicConfig(
 logger = logging.getLogger("PollBot")
 
 # ==================== CONFIGURATION ====================
-BOT_TOKEN = "YOUR_BOT_TOKEN_HERE"  # Replace with token from @BotFather
-ADMIN_ID = 123456789              # Replace with your Telegram numeric User ID
-SUPPORT_USERNAME = "YourUsername"  # Replace with support username without @
-CHANNEL_USERNAME = "YourChannel"   # Replace with update channel username without @
+# Read from environment variables (for Render/VPS) or fallback to hardcoded values
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
+SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourUsername")
+CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "YourChannel")
 
 API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
+
+
+# ==================== RENDER / WEB SERVICE KEEP-ALIVE ====================
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"Telegram Poll Bot is active and running 24/7 on Render!")
+
+    def log_message(self, format, *args):
+        pass  # Suppress normal access logs
+
+def start_render_health_server():
+    port = int(os.getenv("PORT", "8080"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+        logger.info(f"Render Web Service health check listening on port {port}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Could not start health check server on port {port}: {e}")
 
 # ==================== DATABASE SETUP ====================
 DB_FILE = "poll_bot.db"
@@ -532,6 +555,12 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str):
 # ==================== POLLING LOOP ====================
 def run_bot():
     init_db()
+    
+    # Start web server if PORT is set (for Render Web Service)
+    if "PORT" in os.environ or os.getenv("RENDER"):
+        t = threading.Thread(target=start_render_health_server, daemon=True)
+        t.start()
+        logger.info("Render background health check server started.")
     bot = TelegramBot(BOT_TOKEN)
 
     logger.info("Checking Bot credentials...")
