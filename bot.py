@@ -2,17 +2,24 @@
 UltraPoll Pro - Next-Generation Telegram Channel & Group Poll Bot
 Created exclusively for YouTube Creators & Telegram Channel Owners.
 
-Key Highlights (Far superior to basic poll bots):
-1. 🎨 100% Full-Color Dynamic Buttons (Telegram Bot API 9.4+ primary/success/danger)
+Key Features & Updates:
+1. 🎨 100% Full-Color Dynamic Buttons (Bot API 9.4+ primary/success/danger)
 2. 👑 Live Dynamic Crown & Leader Highlighting (Leader button turns Green + Crown)
 3. 📊 Visual ASCII Progress Bars & Real-Time Percentages directly in channel message
 4. 🛡️ Force Channel Subscribe (Optional Anti-Cheat: Voters must join channel)
-5. 🔄 1-Click Vote Retraction & Vote Switching
-6. 🕒 Custom Timer / Expiration Auto-Lock
-7. 📝 Multi-format Input: Separate by Newline, Comma, or Ampersand (&)
-8. 🏆 Cinematic Final Winner Celebration Card with Rank Badges
-9. ⚡ Render.com 24/7 Web Service Health Server (Zero port timeout errors)
-10. 💾 SQLite Database with 100% Data Persistence
+5. 🚫 Real-time Anti-Leave Vote Revocation (Vote is auto-cancelled & deducted if user leaves channel)
+6. 📈 Live Display of Valid Votes & Cancelled/Revoked Votes
+7. 👑 Admin Panel (/admin):
+   - 📢 Broadcast message to all bot users in 1 click (with success/blocked report)
+   - ✏️ Change Support Username dynamically from Admin Panel without editing code
+   - 📢 Change Official Channel Username dynamically from Admin Panel
+   - 📊 Deep Live Analytics & Revoked Vote Stats
+8. 📋 In-bot Step-by-Step Channel Permission Guide (যাতে সবাই সহজে পারমিশন বুঝতে পারে)
+9. 🔄 1-Click Vote Retraction & Vote Switching
+10. 📝 Multi-format Input: Separate by Newline, Comma, or Ampersand (&)
+11. 🏆 Cinematic Final Winner Celebration Card with Rank Badges
+12. ⚡ Render.com 24/7 Web Service Health Server (Zero port timeout errors)
+13. 💾 SQLite Database with 100% Data Persistence
 """
 
 import os
@@ -35,13 +42,12 @@ logger = logging.getLogger("UltraPollPro")
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))
-SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportUsername")
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "YourUpdateChannel")
+DEFAULT_SUPPORT_USERNAME = os.getenv("SUPPORT_USERNAME", "YourSupportUsername")
+DEFAULT_CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "YourUpdateChannel")
 
 # Telegram Bot API 9.4 button styles:
 # 'primary' = Deep Blue | 'success' = Vibrant Green | 'danger' = Bright Red
 COLOR_CYCLE = ["primary", "success", "danger"]
-DEFAULT_EMOJIS = ["🔥", "⭐", "💎", "⚡", "🚀", "🏆", "🎯", "🌟", "🏏", "⚽", "🎮", "❤️"]
 
 # ==================== RENDER / WEB SERVICE KEEP-ALIVE ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -105,6 +111,39 @@ def init_db():
         voted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         PRIMARY KEY (poll_id, user_id)
     )''')
+    # Revoked Votes table (for anti-leave tracking)
+    c.execute('''CREATE TABLE IF NOT EXISTS revoked_votes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        poll_id TEXT,
+        user_id INTEGER,
+        option_index INTEGER,
+        revoked_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        reason TEXT DEFAULT 'left_channel'
+    )''')
+    # Settings table (for dynamic support & channel IDs via Admin Panel)
+    c.execute('''CREATE TABLE IF NOT EXISTS settings (
+        key TEXT PRIMARY KEY,
+        value TEXT
+    )''')
+    # Insert default settings if not exists
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('support_username', ?)", (DEFAULT_SUPPORT_USERNAME,))
+    c.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('channel_username', ?)", (DEFAULT_CHANNEL_USERNAME,))
+
+    conn.commit()
+    conn.close()
+
+def get_setting(key: str, default: str = "") -> str:
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else default
+
+def set_setting(key: str, value: str):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO settings (key, value) VALUES (?, ?)", (key, value))
     conn.commit()
     conn.close()
 
@@ -136,6 +175,10 @@ class TelegramBot:
             payload["reply_markup"] = reply_markup
         return self.request("editMessageText", payload)
 
+    def edit_reply_markup(self, chat_id: Any, message_id: int, reply_markup: Optional[Dict] = None) -> Dict:
+        payload = {"chat_id": chat_id, "message_id": message_id, "reply_markup": reply_markup}
+        return self.request("editMessageReplyMarkup", payload)
+
     def answer_callback(self, callback_query_id: str, text: Optional[str] = None, show_alert: bool = False) -> Dict:
         payload = {"callback_query_id": callback_query_id, "show_alert": show_alert}
         if text:
@@ -148,7 +191,7 @@ class TelegramBot:
     def get_me(self) -> Dict:
         return self.request("getMe")
 
-# State tracking for multi-step poll wizard
+# State tracking for multi-step wizards
 user_states: Dict[int, Dict] = {}
 
 # ==================== ADVANCED VISUAL FORMATTING ====================
@@ -169,7 +212,7 @@ def clean_channel_id(ch: str) -> str:
 
 def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
     """
-    Constructs both the channel message body (with rankings & progress bars)
+    Constructs both the channel message body (with rankings, progress bars & revoked stats)
     and the colorful inline keyboard buttons.
     """
     conn = sqlite3.connect(DB_FILE)
@@ -189,6 +232,10 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
     counts = dict(c.fetchall())
     total_votes = sum(counts.values())
 
+    # Count revoked votes (from users who left the channel)
+    c.execute("SELECT COUNT(*) FROM revoked_votes WHERE poll_id = ?", (poll_id,))
+    revoked_count = c.fetchone()[0]
+
     # Find highest votes for dynamic crown 👑
     max_votes = -1
     leader_index = -1
@@ -203,7 +250,7 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
 
     # 1. BUILD VIBRANT MESSAGE TEXT
     status_badge = "🟢 <b>ভোট গ্রহণ চলছে</b>" if not is_closed else "🔴 <b>পোল সমাপ্ত</b>"
-    
+
     text = f"✨ <b>অফিসিয়াল পোল কনটেস্ট</b> | {status_badge}\n"
     text += "━━━━━━━━━━━━━━━━━━━━\n"
     text += f"📌 <b>প্রশ্ন:</b>\n👉 <b>{title}</b>\n\n"
@@ -219,16 +266,21 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
         text += f"   <code>[{bar}]</code> <b>{pct:.1f}%</b> ({cnt} ভোট)"
 
     text += "\n\n━━━━━━━━━━━━━━━━━━━━\n"
-    text += f"📈 <b>মোট ভোট সংগৃহীত:</b> <code>{total_votes}</code> টি\n"
+    text += f"📈 <b>মোট বৈধ ভোট:</b> <code>{total_votes}</code> টি\n"
+    if revoked_count > 0:
+        text += f"🚫 <b>চ্যানেল ত্যাগের কারণে বাতিল ভোট:</b> <code>{revoked_count}</code> টি\n"
+
     if force_sub:
         text += f"🛡️ <i>ভোট দিতে {force_sub} চ্যানেলে জয়েন থাকা বাধ্যতামূলক।</i>\n"
 
     if not is_closed:
-        text += "👇 <i>পছন্দের প্রার্থীকে জয়ী করতে নিচের বাটনে চাপ দিন:</i>"
+        text += "👇 <i>পছন্দের প্রার্থীকে ভোট দিতে নিচের বাটনে চাপ দিন:</i>"
     else:
         winner_name = ranked_options[0][1] if total_votes > 0 else "কেউ নন"
         text += f"\n🏆 <b>চূড়ান্ত বিজয়ী:</b> {winner_name} 🎉\n"
-        text += "🛑 <i>এই পোলটিতে নতুন ভোট গ্রহণ বন্ধ রয়েছে।</i>"
+        if revoked_count > 0:
+            text += f"⚠️ <i>(চ্যানেল ত্যাগের কারণে {revoked_count} টি অবৈধ ভোট স্বয়ংক্রিয়ভাবে বাদ দেওয়া হয়েছে)</i>\n"
+        text += "🛑 <i>এই পোলটিতে নতুন ভোট গ্রহণ সমাপ্ত হয়েছে।</i>"
 
     # 2. BUILD FULL-COLOR BUTTONS (Bot API 9.4+)
     keyboard = []
@@ -237,14 +289,13 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
     for opt_idx, opt_text, emoji, base_color in options:
         cnt = counts.get(opt_idx, 0)
         is_leader = (cnt > 0 and opt_idx == leader_index)
-        
+
         # Leader gets glowing crown and success (green) style
         if is_leader:
             btn_text = f"👑 {opt_text} ({cnt})"
             btn_style = "success"
         else:
             btn_text = f"{opt_text} ({cnt})"
-            # Cycle colors across remaining candidates so every button is colorful!
             btn_style = COLOR_CYCLE[opt_idx % len(COLOR_CYCLE)]
 
         btn = {
@@ -263,12 +314,18 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
     # Action / Control Buttons
     if not is_closed:
         keyboard.append([
+            {"text": "👥 ভোটার তালিকা (Username & ID)", "callback_data": f"voters:{poll_id}", "style": "primary"}
+        ])
+        keyboard.append([
             {"text": "🔄 ভোট প্রত্যাহার করুন", "callback_data": f"retract:{poll_id}", "style": "primary"}
         ])
         keyboard.append([
             {"text": "🛑 পোল সমাপ্ত ও বিজয়ী ঘোষণা", "callback_data": f"close:{poll_id}", "style": "danger"}
         ])
     else:
+        keyboard.append([
+            {"text": "👥 সম্পূর্ণ ভোটার তালিকা দেখুন", "callback_data": f"voters:{poll_id}", "style": "primary"}
+        ])
         bot_link = f"https://t.me/{bot_username}" if bot_username else "https://t.me"
         keyboard.append([
             {"text": "🤖 আপনিও এমন আকর্ষণীয় পোল তৈরি করুন", "url": bot_link, "style": "success"}
@@ -277,15 +334,96 @@ def build_live_poll_content(poll_id: str, bot_username: str) -> (str, Dict):
     conn.close()
     return text, {"inline_keyboard": keyboard}
 
-def main_menu_keyboard():
-    return {
-        "keyboard": [
-            [{"text": "⚡ Create Ultra Poll", "style": "primary"}],
-            [{"text": "👤 My Profile", "style": "success"}, {"text": "📊 Live Stats", "style": "danger"}],
-            [{"text": "📞 24/7 Support", "style": "primary"}]
-        ],
-        "resize_keyboard": True
-    }
+
+def build_voters_list_text(poll_id: str) -> str:
+    """
+    Constructs a detailed voter list showing candidate-by-candidate:
+    Voter First Name, @Username, and numeric User ID!
+    """
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT title FROM polls WHERE poll_id = ?", (poll_id,))
+    row = c.fetchone()
+    title = row[0] if row else "পোল"
+
+    c.execute("SELECT option_index, option_text FROM poll_options WHERE poll_id = ? ORDER BY option_index", (poll_id,))
+    options = c.fetchall()
+
+    text = "👥 <b>ভোটার তালিকা ও পরিচিতি (User Name & ID):</b>\n"
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📌 <b>পোল:</b> {title}\n\n"
+
+    total_voters = 0
+    for opt_idx, opt_text in options:
+        c.execute("""
+            SELECT v.user_id, u.first_name, u.username
+            FROM votes v
+            LEFT JOIN users u ON v.user_id = u.user_id
+            WHERE v.poll_id = ? AND v.option_index = ?
+            ORDER BY v.voted_at ASC
+        """, (poll_id, opt_idx))
+        voters = c.fetchall()
+        v_count = len(voters)
+        total_voters += v_count
+
+        text += f"🔹 <b>{opt_text}</b> ({v_count} ভোট):\n"
+        if voters:
+            for uid, fname, uname in voters:
+                name_display = fname if fname else "User"
+                username_display = f"@{uname}" if uname else "<i>(ইউজারনেম নেই)</i>"
+                text += f"  • {name_display} ({username_display}) | <code>ID: {uid}</code>\n"
+        else:
+            text += "  <i>(এখনো কোনো ভোট পড়েনি)</i>\n"
+        text += "\n"
+
+    # Revoked votes
+    c.execute("""
+        SELECT rv.user_id, u.first_name, u.username
+        FROM revoked_votes rv
+        LEFT JOIN users u ON rv.user_id = u.user_id
+        WHERE rv.poll_id = ?
+        ORDER BY rv.revoked_at DESC
+    """, (poll_id,))
+    revoked_voters = c.fetchall()
+
+    if revoked_voters:
+        text += f"🚫 <b>চ্যানেল ছাড়ার কারণে বাতিল ভোটার ({len(revoked_voters)} জন):</b>\n"
+        for r_uid, r_fname, r_uname in revoked_voters:
+            r_name = r_fname if r_fname else "User"
+            r_un = f"@{r_uname}" if r_uname else "<i>(No Username)</i>"
+            text += f"  ❌ {r_name} ({r_un}) | <code>ID: {r_uid}</code>\n"
+        text += "\n"
+
+    text += "━━━━━━━━━━━━━━━━━━━━\n"
+    text += f"📈 <b>মোট বৈধ ভোটার:</b> <code>{total_voters}</code> জন"
+    conn.close()
+    return text
+
+def main_menu_keyboard(user_id: int):
+    buttons = [
+        [{"text": "⚡ Create Ultra Poll", "style": "primary"}],
+        [{"text": "👤 My Profile", "style": "success"}, {"text": "📊 Live Stats", "style": "danger"}],
+        [{"text": "📖 পারমিশন গাইড", "style": "primary"}, {"text": "📞 24/7 Support", "style": "success"}]
+    ]
+    # Admin sees special Admin Panel button
+    if user_id == ADMIN_ID:
+        buttons.append([{"text": "⚙️ Admin Panel", "style": "danger"}])
+
+    return {"keyboard": buttons, "resize_keyboard": True}
+
+def get_permission_guide_text():
+    return (
+        "📋 <b>চ্যানেল পারমিশন গাইডলাইন (অবশ্যই পড়ুন)</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "বট সঠিকভাবে কাজ করার জন্য এবং <b>ভোট দিয়ে কেউ চ্যানেল ত্যাগ করলে স্বয়ংক্রিয়ভাবে ভোট কাটার জন্য</b> বটকে চ্যানেলে নিচের পারমিশনগুলো দিতে হবে:\n\n"
+        "✅ <b>১. বটকে চ্যানেলে Administrator হিসেবে যুক্ত করুন।</b>\n"
+        "✅ <b>২. Post Messages (পোস্ট পাঠানোর অনুমতি)</b> — চালু রাখুন।\n"
+        "✅ <b>৩. Edit Messages of Others (মেসেজ এডিট করার অনুমতি)</b> — চালু রাখুন।\n"
+        "✅ <b>৪. Manage Channel / Recent Actions (মেম্বারদের গতিবিধি দেখার অনুমতি)</b> — চালু রাখুন।\n\n"
+        "🛡️ <b>অ্যান্টি-লিভ সুবিধার কার্যকারিতা:</b>\n"
+        "বট অ্যাডমিন থাকলে কেউ ভোট দিয়ে চ্যানেল ছাড়লেই (Unsubscribe) সাথে সাথে তার ভোট লাইভ ডিসপ্লে থেকে কেটে যাবে এবং ভূতুড়ে ভোট রোধ হবে!\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
 
 # ==================== MESSAGE HANDLER ====================
 def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
@@ -302,6 +440,73 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
     c.execute("INSERT OR REPLACE INTO users (user_id, first_name, username) VALUES (?, ?, ?)", (user_id, first_name, username))
     conn.commit()
     conn.close()
+
+    # Cancel command for any active wizard
+    if text == "/cancel":
+        if user_id in user_states:
+            del user_states[user_id]
+            bot.send_message(chat_id, "❌ কার্যক্রম বাতিল করা হয়েছে।", reply_markup=main_menu_keyboard(user_id))
+            return
+
+    # Handle Admin States (Broadcast, Support ID, Channel ID)
+    if chat_type == "private" and user_id in user_states and user_id == ADMIN_ID:
+        state = user_states[user_id]
+        step = state.get("step")
+
+        if step == "waiting_for_broadcast":
+            del user_states[user_id]
+            bot.send_message(chat_id, "⏳ <b>ব্রডকাস্ট শুরু হয়েছে... অনুগ্রহ করে অপেক্ষা করুন।</b>")
+
+            conn = sqlite3.connect(DB_FILE)
+            c = conn.cursor()
+            c.execute("SELECT user_id FROM users")
+            all_users = c.fetchall()
+            conn.close()
+
+            total_users = len(all_users)
+            success_count = 0
+            failed_count = 0
+
+            for (target_uid,) in all_users:
+                res = bot.send_message(target_uid, f"📢 <b>অফিসিয়াল নোটিশ:</b>\n\n{text}")
+                if res.get("ok"):
+                    success_count += 1
+                else:
+                    failed_count += 1
+                time.sleep(0.04)  # Rate-limit safety
+
+            report = (
+                "📢 <b>ব্রডকাস্ট রিপোর্ট সম্পন্ন!</b>\n"
+                "━━━━━━━━━━━━━━━━━━━━\n"
+                f"👥 <b>মোট ইউজার:</b> {total_users} জন\n"
+                f"✅ <b>সফলভাবে পাঠানো হয়েছে:</b> {success_count} জন\n"
+                f"🚫 <b>ব্লক বা ব্যর্থ:</b> {failed_count} জন\n"
+                "━━━━━━━━━━━━━━━━━━━━"
+            )
+            bot.send_message(chat_id, report, reply_markup=main_menu_keyboard(user_id))
+            return
+
+        elif step == "waiting_for_support_id":
+            new_sup = text.replace("@", "").strip()
+            set_setting("support_username", new_sup)
+            del user_states[user_id]
+            bot.send_message(
+                chat_id,
+                f"✅ <b>সাপোর্ট আইডি সফলভাবে পরিবর্তন করা হয়েছে!</b>\n\nনতুন সাপোর্ট আইডি: @{new_sup}",
+                reply_markup=main_menu_keyboard(user_id)
+            )
+            return
+
+        elif step == "waiting_for_channel_id":
+            new_ch = text.replace("@", "").strip()
+            set_setting("channel_username", new_ch)
+            del user_states[user_id]
+            bot.send_message(
+                chat_id,
+                f"✅ <b>অফিসিয়াল চ্যানেল সফলভাবে পরিবর্তন করা হয়েছে!</b>\n\nনতুন চ্যানেল: @{new_ch}",
+                reply_markup=main_menu_keyboard(user_id)
+            )
+            return
 
     # Step-by-Step Creation Wizard
     if chat_type == "private" and user_id in user_states:
@@ -346,7 +551,6 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
 
         # Step 3: Parse Options
         elif step == "waiting_for_options":
-            # Smart parser: handles newline, comma, and ampersand automatically
             raw_text = text.replace("&", "\n").replace(",", "\n")
             candidates = [line.strip() for line in raw_text.split("\n") if line.strip()]
 
@@ -370,7 +574,7 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
                 chat_id,
                 "🛡️ <b>অ্যান্টি-চিট ও ফোর্স সাবস্ক্রাইব (Force Subscribe):</b>\n\n"
                 "আপনি কি চান যে ভোটারদের ভোট দেওয়ার আগে আপনার চ্যানেলে জয়েন থাকা বাধ্যতামূলক হোক?\n"
-                "<i>(এটি চালু রাখলে আপনার চ্যানেলে হাজার হাজার রিয়েল সাবস্ক্রাইবার বাড়বে এবং ফেক ভোট রোধ হবে!)</i>",
+                "<i>(এটি চালু রাখলে আপনার চ্যানেলে প্রচুর রিয়েল সাবস্ক্রাইবার বাড়বে এবং ফেক ভোট রোধ হবে!)</i>",
                 reply_markup=markup
             )
             return
@@ -380,27 +584,31 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
         welcome = (
             f"👑 <b>আসসালামু আলাইকুম, {first_name}!</b>\n\n"
             "✨ <b>UltraPoll Pro</b> — টেলিগ্রামের সবচেয়ে আধুনিক ও কালারফুল পোল মেকার বটে স্বাগতম!\n\n"
-            "🚀 <b>আমাদের স্পেশাল ফিচারসমূহ:</b>\n"
+            "🚀 <b>আমাদের প্রিমিয়াম ফিচারসমূহ:</b>\n"
             "• 🎨 <b>ফুল কালার বাটন:</b> নীল, সবুজ ও লাল স্টাইলের নজরকাড়া বাটন\n"
             "• 👑 <b>লাইভ ক্রাউন সিস্টেম:</b> লিডার প্রার্থীর বাটনে স্বয়ংক্রিয় মুকুট\n"
             "• 📊 <b>গ্রাফিক্যাল প্রগ্রেস বার:</b> পার্সেন্টেজসহ রিয়েল-টাইম ডিসপ্লে\n"
+            "• 🚫 <b>অটো ভোট কর্তন:</b> চ্যানেল লিভ নিলে সাথে সাথে ভোট বাতিল!\n"
             "• 🛡️ <b>ফোর্স সাবস্ক্রাইব:</b> চ্যানেলে মেম্বার বাড়ানোর দুর্দান্ত সিস্টেম\n"
-            "• 🔄 <b>ভোট প্রত্যাহার ও পরিবর্তন সুবিধা</b>\n"
+            "• 🔄 <b>ভোট প্রত্যাহার ও পরিবর্তনের সুবিধা</b>\n"
             "• 🛑 <b>১-ক্লিকে চূড়ান্ত বিজয়ী কার্ড ঘোষণা</b>\n\n"
             "👇 <b>পোল তৈরি করতে নিচের বাটনে চাপ দিন:</b>"
         )
-        bot.send_message(chat_id, welcome, reply_markup=main_menu_keyboard())
+        bot.send_message(chat_id, welcome, reply_markup=main_menu_keyboard(user_id))
 
     elif text == "⚡ Create Ultra Poll" or text == "/create":
         user_states[user_id] = {"step": "waiting_for_channel"}
-        bot.send_message(
-            chat_id,
+        create_guide = (
             "🎯 <b>পোল ক্রিয়েশন উইজার্ড</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "প্রথমে যে চ্যানেলে পোলটি পাঠাবেন সেই চ্যানেলের <b>ইউজারনেম বা লিংক</b> পাঠান:\n\n"
             "<i>উদাহরণ:</i> <code>@mychannel</code> অথবা <code>https://t.me/mychannel</code>\n\n"
-            "⚠️ <i>নোট: বটকে অবশ্যই চ্যানেলে অ্যাডমিন বানিয়ে Post Messages পারমিশন দিয়ে রাখবেন।</i>"
+            "⚠️ <b>জরুরি পারমিশন:</b> নিশ্চিত করুন যে বটকে চ্যানেলে অ্যাডমিন বানিয়ে <b>Post Messages ও Manage Channel</b> পারমিশন দেওয়া আছে।"
         )
+        bot.send_message(chat_id, create_guide)
+
+    elif text == "📖 পারমিশন গাইড" or text == "/guide":
+        bot.send_message(chat_id, get_permission_guide_text())
 
     elif text == "👤 My Profile" or text == "/profile":
         conn = sqlite3.connect(DB_FILE)
@@ -435,38 +643,91 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
         act_cnt = c.fetchone()[0]
         c.execute("SELECT COUNT(*) FROM votes")
         v_cnt = c.fetchone()[0]
+        c.execute("SELECT COUNT(*) FROM revoked_votes")
+        rev_cnt = c.fetchone()[0]
         conn.close()
+
+        support_un = get_setting("support_username", DEFAULT_SUPPORT_USERNAME)
+        channel_un = get_setting("channel_username", DEFAULT_CHANNEL_USERNAME)
 
         stats = (
             "📊 <b>UltraPoll Pro লাইভ স্ট্যাটিস্টিক্স</b>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
-            f"👑 <b>মালিক ও ডেভেলপার:</b> @{SUPPORT_USERNAME}\n"
+            f"👑 <b>মালিক ও ডেভেলপার:</b> @{support_un}\n"
             f"👥 <b>মোট ব্যবহারকারী:</b> {u_cnt} জন\n"
             f"🗳️ <b>মোট আয়োজিত পোল:</b> {p_cnt} টি\n"
             f"🟢 <b>বর্তমানে চলমান পোল:</b> {act_cnt} টি\n"
-            f"🎯 <b>মোট কাস্টকৃত ভোট:</b> {v_cnt} টি\n"
-            "⚡ <b>ভার্সন:</b> 5.0 Ultra Pro (Telegram Bot API 9.4)\n"
+            f"🎯 <b>মোট বৈধ ভোট:</b> {v_cnt} টি\n"
+            f"🚫 <b>বাতিলকৃত ভূতুড়ে ভোট:</b> {rev_cnt} টি\n"
+            "⚡ <b>ভার্সন:</b> 6.0 Ultra Enterprise (Full Features)\n"
             "━━━━━━━━━━━━━━━━━━━━"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "🌐 আমাদের অফিসিয়াল চ্যানেল", "url": f"https://t.me/{CHANNEL_USERNAME}", "style": "primary"}]
+                [{"text": "🌐 আমাদের অফিসিয়াল চ্যানেল", "url": f"https://t.me/{channel_un}", "style": "primary"}]
             ]
         }
         bot.send_message(chat_id, stats, reply_markup=markup)
 
     elif text == "📞 24/7 Support" or text == "/support":
+        support_un = get_setting("support_username", DEFAULT_SUPPORT_USERNAME)
         supp = (
             "✨ <b>২৪/৭ হেল্প ও কাস্টমার সাপোর্ট</b>\n\n"
-            "যেকোনো প্রযুক্তিগত সহায়তা বা চ্যানেল প্রোমোশনের জন্য আমাদের টিমের সাথে সরাসরি যোগাযোগ করুন।"
+            "যেকোনো প্রযুক্তিগত সহায়তা বা চ্যানেল প্রমোশনের জন্য আমাদের সাপোর্ট টিমের সাথে সরাসরি যোগাযোগ করুন।"
         )
         markup = {
             "inline_keyboard": [
-                [{"text": "💬 সরাসরি সাপোর্ট ইনবক্সে মেসেজ দিন", "url": f"https://t.me/{SUPPORT_USERNAME}", "style": "success"}]
+                [{"text": "💬 সরাসরি সাপোর্ট ইনবক্সে মেসেজ দিন", "url": f"https://t.me/{support_un}", "style": "success"}]
             ]
         }
         bot.send_message(chat_id, supp, reply_markup=markup)
 
+    # Admin Panel Menu
+    elif (text == "⚙️ Admin Panel" or text == "/admin") and user_id == ADMIN_ID:
+        send_admin_dashboard(bot, chat_id)
+
+def send_admin_dashboard(bot: TelegramBot, chat_id: int):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT COUNT(*) FROM users")
+    total_users = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM polls")
+    total_polls = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM polls WHERE is_closed = 0")
+    active_polls = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM votes")
+    total_votes = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM revoked_votes")
+    total_revoked = c.fetchone()[0]
+    conn.close()
+
+    support_un = get_setting("support_username", DEFAULT_SUPPORT_USERNAME)
+    channel_un = get_setting("channel_username", DEFAULT_CHANNEL_USERNAME)
+
+    admin_text = (
+        "👑 <b>অ্যাডমিন কন্ট্রোল ড্যাশবোর্ড</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"👥 <b>মোট ইউজার:</b> {total_users} জন\n"
+        f"🗳️ <b>মোট পোল:</b> {total_polls} টি\n"
+        f"🟢 <b>একটিভ পোল:</b> {active_polls} টি\n"
+        f"🎯 <b>মোট বৈধ ভোট:</b> {total_votes} টি\n"
+        f"🚫 <b>চ্যানেল লিভে বাতিল ভোট:</b> {total_revoked} টি\n\n"
+        "⚙️ <b>বর্তমান ডায়নামিক সেটিংস:</b>\n"
+        f"• <b>সাপোর্ট আইডি:</b> @{support_un}\n"
+        f"• <b>অফিসিয়াল চ্যানেল:</b> @{channel_un}\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "👇 <i>নিচের বাটন দিয়ে সেটিংস পরিবর্তন বা ব্রডকাস্ট করুন:</i>"
+    )
+
+    markup = {
+        "inline_keyboard": [
+            [{"text": "📢 ব্রডকাস্ট মেসেজ পাঠান", "callback_data": "adm_broadcast", "style": "primary"}],
+            [{"text": "✏️ সাপোর্ট আইডি পরিবর্তন", "callback_data": "adm_support", "style": "success"}],
+            [{"text": "📢 চ্যানেল ইউজারনেম পরিবর্তন", "callback_data": "adm_channel", "style": "primary"}],
+            [{"text": "🔄 রিফ্রেশ ড্যাশবোর্ড", "callback_data": "adm_refresh", "style": "danger"}]
+        ]
+    }
+    bot.send_message(chat_id, admin_text, reply_markup=markup)
 
 # ==================== CALLBACK QUERY HANDLER ====================
 def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id: int):
@@ -481,6 +742,46 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
 
     chat_id = message["chat"]["id"]
     message_id = message["message_id"]
+
+    # Admin Panel Callbacks
+    if data.startswith("adm_") and user_id == ADMIN_ID:
+        if data == "adm_broadcast":
+            user_states[user_id] = {"step": "waiting_for_broadcast"}
+            bot.answer_callback(cb_id)
+            bot.send_message(
+                chat_id,
+                "📢 <b>সকল ব্যবহারকারীদের জন্য ব্রডকাস্ট মেসেজ পাঠান:</b>\n\n"
+                "আপনি সব ইউজারদের যে নোটিশ বা মেসেজটি পাঠাতে চান তা লিখে পাঠান (HTML ফরম্যাট সাপোর্ট করে)।\n\n"
+                "<i>বাতিল করতে চাইলে /cancel লিখুন।</i>"
+            )
+            return
+
+        elif data == "adm_support":
+            user_states[user_id] = {"step": "waiting_for_support_id"}
+            bot.answer_callback(cb_id)
+            bot.send_message(
+                chat_id,
+                "✏️ <b>নতুন সাপোর্ট ইউজারনেম পাঠান:</b>\n"
+                "যেমন: <code>@MySupportUsername</code>\n\n"
+                "<i>বাতিল করতে চাইলে /cancel লিখুন।</i>"
+            )
+            return
+
+        elif data == "adm_channel":
+            user_states[user_id] = {"step": "waiting_for_channel_id"}
+            bot.answer_callback(cb_id)
+            bot.send_message(
+                chat_id,
+                "📢 <b>নতুন অফিসিয়াল চ্যানেল ইউজারনেম পাঠান:</b>\n"
+                "যেমন: <code>@MyChannelUsername</code>\n\n"
+                "<i>বাতিল করতে চাইলে /cancel লিখুন।</i>"
+            )
+            return
+
+        elif data == "adm_refresh":
+            bot.answer_callback(cb_id, "🔄 রিফ্রেশ করা হয়েছে!")
+            send_admin_dashboard(bot, chat_id)
+            return
 
     # Wizard: Force-Sub Choice
     if data in ["fsub_yes", "fsub_no"]:
@@ -520,7 +821,7 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
                 chat_id,
                 f"❌ <b>চ্যানেলে পোস্ট পাঠাতে ব্যর্থ হয়েছে!</b>\n\n"
                 f"<b>কারণ:</b> <code>{err}</code>\n\n"
-                f"📌 অনুগ্রহ করে বট (@{bot_username})-কে আপনার চ্যানেল <b>{channel}</b>-এ অ্যাডমিন হিসেবে যুক্ত করে পোস্ট পারমিশন অন করুন।"
+                f"📌 <b>সমাধান:</b> অনুগ্রহ করে বট (@{bot_username})-কে আপনার চ্যানেল <b>{channel}</b>-এ অ্যাডমিন হিসেবে যুক্ত করে <b>Post Messages ও Manage Channel</b> পারমিশন অন করুন।"
             )
             del user_states[user_id]
             bot.answer_callback(cb_id)
@@ -542,9 +843,10 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
             f"📢 <b>চ্যানেল:</b> {channel}\n"
             f"📌 <b>প্রশ্ন:</b> {title}\n"
             f"👥 <b>মোট অপশন:</b> {len(candidates)} টি\n"
-            f"🛡️ <b>ফোর্স সাবস্ক্রাইব:</b> {'সক্রিয় ✅' if force_sub else 'নিষ্ক্রিয় ❌'}\n\n"
+            f"🛡️ <b>ফোর্স সাবস্ক্রাইব:</b> {'সক্রিয় ✅' if force_sub else 'নিষ্ক্রিয় ❌'}\n"
+            f"🚫 <b>অ্যান্টি-লিভ প্রোটেকশন:</b> সক্রিয় ✅ (কেউ লিভ নিলে সাথে সাথে ভোট কাটা যাবে)\n\n"
             "ভোটাররা এখন লাইভ প্রগ্রেস বার ও ফুল কালার বাটনে ভোট দিতে পারছেন।",
-            reply_markup=main_menu_keyboard()
+            reply_markup=main_menu_keyboard(user_id)
         )
         return
 
@@ -579,6 +881,12 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
                     return
             else:
                 logger.warning(f"Could not verify membership for {user_id} in {force_sub}")
+
+        # Ensure voter info is recorded in users table
+        first_name = from_user.get("first_name", "User")
+        username = from_user.get("username", "")
+        c.execute("INSERT OR REPLACE INTO users (user_id, first_name, username) VALUES (?, ?, ?)", (user_id, first_name, username))
+        conn.commit()
 
         # Check existing vote
         c.execute("SELECT option_text FROM poll_options WHERE poll_id = ? AND option_index = ?", (poll_id, opt_idx))
@@ -637,19 +945,33 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
         new_text, new_markup = build_live_poll_content(poll_id, bot_username)
         bot.edit_message(chat_id, message_id, new_text, reply_markup=new_markup)
 
+    # View Voters List (Names, Usernames & User IDs)
+    elif data.startswith("voters:"):
+        _, poll_id = data.split(":")
+        voter_report = build_voters_list_text(poll_id)
+
+        # Try sending report to user's private inbox first
+        dm_res = bot.send_message(user_id, voter_report)
+        if dm_res.get("ok"):
+            bot.answer_callback(cb_id, "📬 ভোটারদের ইউজারনেম ও আইডি তালিকা আপনার ইনবক্সে পাঠানো হয়েছে!", show_alert=True)
+        else:
+            # If user has not started bot in DM, send in current chat
+            bot.send_message(chat_id, voter_report)
+            bot.answer_callback(cb_id)
+
     # Stop & Declare Winner
     elif data.startswith("close:"):
         _, poll_id = data.split(":")
         conn = sqlite3.connect(DB_FILE)
         c = conn.cursor()
-        c.execute("SELECT creator_id FROM polls WHERE poll_id = ?", (poll_id,))
+        c.execute("SELECT creator_id, channel_id FROM polls WHERE poll_id = ?", (poll_id,))
         row = c.fetchone()
         if not row:
             conn.close()
             bot.answer_callback(cb_id, "❌ পোল পাওয়া যায়নি!", show_alert=True)
             return
 
-        creator_id = row[0]
+        creator_id, channel_id = row
         # Permission check: creator, bot admin, or channel admin
         is_admin = (user_id == creator_id or user_id == ADMIN_ID)
         if not is_admin:
@@ -663,18 +985,21 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
             return
 
         # Audit sweep: verify all voters before finalizing to purge any who left
-        c.execute("SELECT user_id FROM votes WHERE poll_id = ?", (poll_id,))
+        c.execute("SELECT user_id, option_index FROM votes WHERE poll_id = ?", (poll_id,))
         voters = c.fetchall()
         purged = 0
-        for (v_uid,) in voters:
-            chk = bot.get_chat_member(chat_id, v_uid)
+        for v_uid, opt_idx in voters:
+            chk = bot.get_chat_member(channel_id, v_uid)
             if chk.get("ok"):
                 st = chk["result"].get("status")
                 if st in ["left", "kicked", "banned"]:
+                    c.execute("INSERT INTO revoked_votes (poll_id, user_id, option_index, reason) VALUES (?, ?, ?, 'sweep_purge')",
+                              (poll_id, v_uid, opt_idx))
                     c.execute("DELETE FROM votes WHERE poll_id = ? AND user_id = ?", (poll_id, v_uid))
                     purged += 1
+
         if purged > 0:
-            logger.info(f"Purged {purged} ghost votes from users who left channel {chat_id}")
+            logger.info(f"Purged {purged} ghost votes from users who left channel {channel_id}")
 
         c.execute("UPDATE polls SET is_closed = 1, closed_at = CURRENT_TIMESTAMP WHERE poll_id = ?", (poll_id,))
         conn.commit()
@@ -685,8 +1010,6 @@ def handle_callback_query(bot: TelegramBot, cb: Dict, bot_username: str, bot_id:
         # Update message into final victory card
         final_text, final_markup = build_live_poll_content(poll_id, bot_username)
         bot.edit_message(chat_id, message_id, final_text, reply_markup=final_markup)
-
-
 
 # ==================== ANTI-LEAVE REAL-TIME VOTE REVOCATION ====================
 def handle_chat_member_updated(bot: TelegramBot, update_data: Dict, bot_username: str):
@@ -724,7 +1047,7 @@ def handle_chat_member_updated(bot: TelegramBot, update_data: Dict, bot_username
 
         placeholders = ",".join("?" for _ in ch_patterns)
         query = f"""
-            SELECT p.poll_id, p.message_id, p.channel_id, p.title
+            SELECT p.poll_id, p.message_id, p.channel_id, p.title, v.option_index
             FROM votes v
             JOIN polls p ON v.poll_id = p.poll_id
             WHERE v.user_id = ?
@@ -734,13 +1057,16 @@ def handle_chat_member_updated(bot: TelegramBot, update_data: Dict, bot_username
         c.execute(query, [user_id] + ch_patterns + ch_patterns)
         affected_polls = c.fetchall()
 
-        for poll_id, msg_id, p_ch, p_title in affected_polls:
-            # Delete user's vote
+        for poll_id, msg_id, p_ch, p_title, opt_idx in affected_polls:
+            # 1. Record in revoked votes for statistics
+            c.execute("INSERT INTO revoked_votes (poll_id, user_id, option_index, reason) VALUES (?, ?, ?, 'left_channel')",
+                      (poll_id, user_id, opt_idx))
+            # 2. Delete user's active vote
             c.execute("DELETE FROM votes WHERE poll_id = ? AND user_id = ?", (poll_id, user_id))
             conn.commit()
             logger.info(f"❌ Cancelled vote for user {user_id} from poll {poll_id} because user left channel!")
 
-            # Update live channel poll
+            # 3. Update live channel poll display in real time
             if msg_id and p_ch:
                 try:
                     new_text, new_markup = build_live_poll_content(poll_id, bot_username)
@@ -748,7 +1074,7 @@ def handle_chat_member_updated(bot: TelegramBot, update_data: Dict, bot_username
                 except Exception as e:
                     logger.error(f"Error updating poll message after member left: {e}")
 
-            # Notify the user privately
+            # 4. Notify the user privately
             try:
                 bot.send_message(
                     user_id,
@@ -786,7 +1112,7 @@ def run_bot():
 
     print(f"\n=======================================================")
     print(f"🚀 UltraPoll Pro Bot চালু হয়েছে: @{bot_username}")
-    print(f"🎨 ফুল কালার বাটন, লাইভ প্রগ্রেস বার ও ফোর্স সাব সক্রিয়!")
+    print(f"👑 অ্যাডমিন প্যানেল, ব্রডকাস্ট, ডায়নামিক সাপোর্ট ও অ্যান্টি-লিভ সক্রিয়!")
     print(f"=======================================================\n")
 
     offset = 0
