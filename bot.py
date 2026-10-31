@@ -51,11 +51,23 @@ COLOR_CYCLE = ["primary", "success", "danger"]
 
 # ==================== RENDER / WEB SERVICE KEEP-ALIVE ====================
 class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        # Support for UptimeRobot and monitoring services sending HEAD requests
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-type", "text/plain; charset=utf-8")
         self.end_headers()
         self.wfile.write(b"UltraPoll Pro Bot is running 24/7 on Render!")
+
+    def do_POST(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(b"OK")
 
     def log_message(self, format, *args):
         pass  # Suppress normal access logs
