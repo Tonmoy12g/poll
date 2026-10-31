@@ -393,6 +393,15 @@ def build_voters_list_text(poll_id: str) -> str:
     conn.close()
     return text
 
+
+def cancel_keyboard():
+    return {
+        "keyboard": [
+            [{"text": "❌ বাতিল করুন", "style": "danger"}]
+        ],
+        "resize_keyboard": True
+    }
+
 def main_menu_keyboard(user_id: int):
     buttons = [
         [{"text": "⚡ Create Ultra Poll", "style": "primary"}],
@@ -435,11 +444,25 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
     conn.commit()
     conn.close()
 
-    # Cancel command for any active wizard
-    if text == "/cancel":
-        if user_id in user_states:
-            del user_states[user_id]
-            bot.send_message(chat_id, "❌ কার্যক্রম বাতিল করা হয়েছে।", reply_markup=main_menu_keyboard(user_id))
+    # List of all menu commands / buttons
+    MENU_BUTTONS = {
+        "/start", "/cancel", "❌ বাতিল করুন",
+        "⚡ Create Ultra Poll", "/create",
+        "📖 পারমিশন গাইড", "/guide",
+        "👤 My Profile", "/profile",
+        "📊 Live Stats", "/stats",
+        "📞 24/7 Support", "/support",
+        "⚙️ Admin Panel", "/admin"
+    }
+
+    # AUTO-CANCEL: If user is in the middle of poll creation and clicks ANY other button,
+    # automatically reset and cancel the previous poll state so it never gets stuck!
+    is_menu_action = (text in MENU_BUTTONS) or text.startswith("/start")
+
+    if is_menu_action and user_id in user_states:
+        del user_states[user_id]
+        if text in ["/cancel", "❌ বাতিল করুন"]:
+            bot.send_message(chat_id, "❌ <b>পোল তৈরির কার্যক্রম বাতিল করা হয়েছে।</b>", reply_markup=main_menu_keyboard(user_id))
             return
 
     # Handle Admin States (Broadcast, Support ID, Channel ID)
@@ -518,7 +541,8 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
                 "✅ <b>চ্যানেল সংরক্ষিত হয়েছে:</b> <code>" + channel + "</code>\n\n"
                 "❓ <b>পোলের শিরোনাম বা প্রশ্ন লিখুন:</b>\n"
                 "<i>(HTML সাপোর্ট করে, যেমন: <b>বোল্ড</b>, <i>ইতালিক</i>)</i>\n\n"
-                "👉 <i>এখন আপনার প্রশ্নটি লিখে পাঠান:</i>"
+                "👉 <i>এখন আপনার প্রশ্নটি লিখে পাঠান:</i>",
+                reply_markup=cancel_keyboard()
             )
             return
 
@@ -540,7 +564,7 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
                 "সাকিব&তামিম&মুশফিক\n\n"
                 "👉 <i>এখন অপশনগুলোর নাম লিখে পাঠান:</i>"
             )
-            bot.send_message(chat_id, guide)
+            bot.send_message(chat_id, guide, reply_markup=cancel_keyboard())
             return
 
         # Step 3: Parse Options
@@ -613,9 +637,10 @@ def handle_message(bot: TelegramBot, msg: Dict, bot_username: str, bot_id: int):
             "<i>(এই পারমিশন অন থাকলেই কেবল টেলিগ্রাম বটকে জানাবে যে কে চ্যানেলে জয়েন করল আর কে চ্যানেল থেকে লিভ নিল—ফলে লিভ নেওয়া মাত্রই ভোট কেটে ফেলার ম্যাজিক সিস্টেমটি নিখুঁতভাবে কাজ করবে!)</i>\n"
             "━━━━━━━━━━━━━━━━━━━━\n"
             "👇 <b>এখন আপনার চ্যানেলের ইউজারনেম বা লিংক (@ সহ) লিখে পাঠান:</b>\n\n"
-            "<i>উদাহরণ:</i> <code>@mychannel</code> অথবা <code>https://t.me/mychannel</code>"
+            "<i>উদাহরণ:</i> <code>@mychannel</code> অথবা <code>https://t.me/mychannel</code>\n"
+            "<i>(বাতিল করতে চাইলে নিচের '❌ বাতিল করুন' বাটনে চাপ দিন)</i>"
         )
-        bot.send_message(chat_id, create_guide)
+        bot.send_message(chat_id, create_guide, reply_markup=cancel_keyboard())
 
     elif text == "📖 পারমিশন গাইড" or text == "/guide":
         bot.send_message(chat_id, get_permission_guide_text())
